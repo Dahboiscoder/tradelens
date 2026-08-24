@@ -1,0 +1,171 @@
+// TradeLens database schema.
+// Postgres in dev and prod (docker-compose.yml runs a local instance) — SQLite can't be
+// deployed to Vercel (ephemeral/read-only filesystem), so there's one provider everywhere.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Plan {
+  FREE
+  PRO
+  TEAM
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  plan         Plan     @default(FREE)
+  createdAt    DateTime @default(now())
+
+  // Stripe — set once the user has started or completed a checkout. `plan` above is kept
+  // in sync from Stripe webhook events (see src/app/api/billing/webhook/route.ts), never
+  // written directly from client input.
+  stripeCustomerId         String? @unique
+  stripeSubscriptionId     String?
+  stripeSubscriptionStatus String? // Stripe's own status string: active, past_due, canceled, ...
+
+  connections ExchangeConnection[]
+  watchlist   WatchlistItem[]
+  orders      Order[]
+  p2pOffers   P2POffer[]
+  p2pThreadsAsOwner       P2PThread[] @relation("ThreadOwner")
+  p2pThreadsAsCounterparty P2PThread[] @relation("ThreadCounterparty")
+  p2pMessages P2PMessage[]
+}
+
+// API credentials are stored encrypted at rest (AES-256-GCM, see src/lib/crypto.ts).
+// Users are instructed in the UI to create read/trade-only keys with no withdrawal
+// permission — this app never requests or needs withdrawal access.
+model ExchangeConnection {
+  id                 String   @id @default(cuid())
+  userId             String
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  exchange           String // ccxt exchange id, e.g. "binance", "coinbase", "kraken"
+  label              String
+  encryptedApiKey    String
+  encryptedApiSecret String
+  createdAt          DateTime @default(now())
+
+  orders Order[]
+
+  @@index([userId])
+}
+
+model WatchlistItem {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  exchange  String // ccxt exchange id used as the public data source for this symbol
+  symbol    String // e.g. "BTC/USDT"
+  createdAt DateTime @default(now())
+
+  @@unique([userId, exchange, symbol])
+  @@index([userId])
+}
+
+enum OrderSide {
+  BUY
+  SELL
+}
+
+enum OrderType {
+  MARKET
+  LIMIT
+}
+
+enum OrderStatus {
+  PENDING
+  FILLED
+  FAILED
+}
+
+// Every order is user-initiated and confirmed in the UI before this row is created —
+// there is no autonomous/bot trading path anywhere in this app.
+model Order {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  connectionId String
+  connection   ExchangeConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  exchange     String
+  symbol       String
+  side         OrderSide
+  type         OrderType
+  amount       Float
+  price        Float? // set for LIMIT orders, null for MARKET
+  status       OrderStatus @default(PENDING)
+  exchangeOrderId String?
+  errorMessage    String?
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+  @@index([connectionId])
+}
+
+enum P2POfferStatus {
+  OPEN
+  COMPLETED
+  CANCELLED
+}
+
+// A P2P offer board + in-app messaging only — TradeLens never touches funds in a P2P
+// trade. Completion (sending fiat/crypto) happens entirely off-platform between the two
+// users; `status` is self-reported by the offer owner and is not a platform guarantee.
+model P2POffer {
+  id            String         @id @default(cuid())
+  userId        String
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  side          OrderSide // poster's perspective: SELL = poster gives up crypto, BUY = poster wants crypto
+  asset         String // e.g. "BTC"
+  amount        Float
+  fiatCurrency  String // e.g. "USD"
+  pricePerUnit  Float
+  paymentMethod String // free text, e.g. "Bank transfer", "Cash in person"
+  notes         String?
+  status        P2POfferStatus @default(OPEN)
+  createdAt     DateTime       @default(now())
+
+  threads P2PThread[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+// One thread per (offer, counterparty) pair — negotiation is always between exactly the
+// offer owner and one interested counterparty, not a public comment board.
+model P2PThread {
+  id             String   @id @default(cuid())
+  offerId        String
+  offer          P2POffer @relation(fields: [offerId], references: [id], onDelete: Cascade)
+  ownerId        String
+  owner          User     @relation("ThreadOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  counterpartyId String
+  counterparty   User     @relation("ThreadCounterparty", fields: [counterpartyId], references: [id], onDelete: Cascade)
+  createdAt      DateTime @default(now())
+
+  messages P2PMessage[]
+
+  @@unique([offerId, counterpartyId])
+  @@index([ownerId])
+  @@index([counterpartyId])
+}
+
+model P2PMessage {
+  id        String    @id @default(cuid())
+  threadId  String
+  thread    P2PThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  senderId  String
+  sender    User      @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  body      String
+  createdAt DateTime  @default(now())
+
+  @@index([threadId])
+}
