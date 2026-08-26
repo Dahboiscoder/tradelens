@@ -6,3 +6,4 @@ dev.db-journal
 .env.local
 *.log
 .stripe-cli
+.DS_Store
